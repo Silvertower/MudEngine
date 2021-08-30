@@ -11,6 +11,7 @@ import java.nio.channels.Selector
 import java.nio.channels.ServerSocketChannel
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
+import java.util.*
 import kotlin.time.Duration
 import kotlin.time.ExperimentalTime
 import kotlin.time.TimeSource.Monotonic
@@ -19,7 +20,8 @@ const val MICROSECONDS_PER_PULSE: Int = 100_000
 const val PULSES_PER_SECOND: Int = 1_000_000 / MICROSECONDS_PER_PULSE
 const val PULSE_RATE: Int = 1_000 / PULSES_PER_SECOND
 
-val ClientList: MutableList<Client> = mutableListOf()
+val game_info: GameInfo = GameInfo()
+val client_list: LinkedList<Client> = LinkedList()
 
 fun runGame(port: Int) {
   val serverInetSocketAddress = try {
@@ -40,31 +42,25 @@ fun runGame(port: Int) {
     return
   }
 
-  val server = Server(
-    serverSocketChannel,
-    serverSocketChannel.socket().inetAddress.hostAddress,
-    serverSocketChannel.socket().localPort
-  )
-
   Log.info { "Server listening [ ${serverSocketChannel.socket().inetAddress.hostAddress}:${serverSocketChannel.socket().localPort} ]" }
 
-  gameLoop(server)
+  gameLoop(serverSocketChannel)
 }
 
 @OptIn(ExperimentalTime::class)
-fun gameLoop(server: Server) {
+fun gameLoop(serverSocketChannel: ServerSocketChannel) {
   var pulse = 0
   var pulseQueue = 0
 
   val sleepSelector = Selector.open()
   val selector = Selector.open()
 
-  server.mode = ServerMode.RUNNING
-  server.socket.register(selector, SelectionKey.OP_ACCEPT, server.socket)
+  game_info.mode = GameMode.RUNNING
+  serverSocketChannel.register(selector, SelectionKey.OP_ACCEPT, serverSocketChannel)
 
   var timer = Monotonic.markNow()
 
-  while (server.mode != ServerMode.SHUTDOWN && pulse < 600) {
+  while (game_info.mode != GameMode.SHUTDOWN) {
     var processTime = timer.elapsedNow()
 
     if (processTime.inWholeMicroseconds >= MICROSECONDS_PER_PULSE) {
@@ -87,30 +83,39 @@ fun gameLoop(server: Server) {
 
     // handle new connections
     for (key in acceptList) {
-      val serverSocketChannel = if (key.isValid) key.attachment() as ServerSocketChannel else continue
-      acceptClient(selector, serverSocketChannel)
+      val server = key.attachment() as ServerSocketChannel
+
+      acceptClient(selector, server)
     }
 
     // process input
     for (key in readList) {
-      val client = if (key.isValid) key.attachment() as Client else continue
+      val client = key.attachment() as Client
+
       if (processInput(client) < 0) {
         closeClient(client)
       }
     }
 
     // process commands
-    for (client in ClientList) {
-      val input = if (client.input.isNotEmpty()) client.input.remove() else continue
+    for (client in client_list) {
+      if ((client.ch.wait > 0 && --client.ch.wait > 0) || client.input.isEmpty()) continue
 
-      when (input.lowercase()) {
-        "shutdown" -> server.mode = ServerMode.SHUTDOWN
+      val input = client.input.remove()
+
+      client.ch.wait = 1
+
+      if (true || client.state == ConnectionState.PLAYING) {
+        processCommand(client.ch, input)
+      } else {
+        handleConnectionState(client, input)
       }
     }
 
     // process output
     for (key in writeList) {
-      val client = if (key.isValid) key.attachment() as Client else continue
+      val client = key.attachment() as Client
+
       if (client.output.isNotEmpty()) {
         if (processOutput(client) < 0) {
           closeClient(client)
@@ -139,15 +144,15 @@ fun gameLoop(server: Server) {
     selector.selectedKeys().clear()
   }
 
-  shutdownGame(server)
+  shutdownGame(serverSocketChannel)
 }
 
-fun shutdownGame(server: Server) {
-  for (client in ClientList) {
-    closeClient(client)
+fun shutdownGame(serverSocketChannel: ServerSocketChannel) {
+  while (client_list.isNotEmpty()) {
+    closeClient(client_list.remove())
   }
 
-  server.socket.close()
+  serverSocketChannel.close()
 }
 
 fun acceptClient(selector: Selector, serverSocketChannel: ServerSocketChannel) {
@@ -163,7 +168,7 @@ fun acceptClient(selector: Selector, serverSocketChannel: ServerSocketChannel) {
     client.socket.configureBlocking(false)
     client.socket.register(selector, SelectionKey.OP_READ or SelectionKey.OP_WRITE, client)
 
-    ClientList.add(client)
+    client_list.add(client)
 
     Log.info { "New client [ ${client.addr}:${client.port} ]" }
   } catch (e: Throwable) {
@@ -176,7 +181,7 @@ fun closeClient(client: Client) {
   Log.info { "Closing client [ ${client.addr} ]." }
 
   client.socket.close()
-  ClientList.remove(client)
+  client_list.remove(client)
 }
 
 fun processInput(client: Client): Int {
@@ -190,12 +195,10 @@ fun processInput(client: Client): Int {
     return -1
   }
 
-  // If we didn't read any bytes, return.
   if (bytesRead <= 0) {
     return bytesRead
   }
 
-  // Flip the buffer for reading.
   readBuffer.flip()
 
   // Setup an ASCII decoder that ignores malformed or unmappable characters.
@@ -204,86 +207,89 @@ fun processInput(client: Client): Int {
     .onMalformedInput(CodingErrorAction.IGNORE)
     .onUnmappableCharacter(CodingErrorAction.IGNORE)
 
-  // Decode the read buffer into a byte array of ASCII characters, then check for a CR/LF.
   val decoded = decoder.decode(readBuffer)
 
   val offset = client.buffer.indexOfFirst { c -> isAsciiNull(c) }
   val length = decoded.remaining()
 
   // Return -1 if the buffer would overflow.
-  if (offset < 0 || offset + length >= client.buffer.lastIndex) {
+  if (offset >= 0 && offset + length > client.buffer.size) {
     return -1
   }
 
-  decoded.get(client.buffer, offset, length)
+  decoded.get(client.buffer, if (offset > -1) offset else 0, length)
 
-  client.buffer[offset + length] = ASCII_NULL
-
-  val nl = client.buffer.indexOfFirst { c -> isAsciiNewline(c) }
-
-  // Return if no newline was found.
-  if (nl < 0) {
-    Log.debug { String(client.buffer) }
-    return bytesRead
-  }
-
-  // At this point, we know we have input to process.
-  val input = CharArray(MAX_INPUT_LENGTH)
   var read = 0
-  var write = 0
-  while (read < client.buffer.size && !isAsciiNull(client.buffer[read])) {
-    var truncate = false
-    while (!isAsciiNewline(client.buffer[read]) && !truncate) {
+  var nl = client.buffer.indexOfFirst { c -> isAsciiNewline(c) }
+  while (nl > -1) {
+    var write = 0
+    val temp = CharArray(MAX_INPUT_LENGTH)
+    while (read < nl && write < temp.size - if (client.buffer[read] != '$') 0 else 1) {
       when {
         isAsciiPrintable(client.buffer[read]) -> {
-          input[write] = client.buffer[read]
-          if (client.buffer[read] == '$') {
+          temp[write] = client.buffer[read]
+
+          if (temp[write] == '$') {
             write++
-            input[write] = '$'
+
+            temp[write] = '$'
           }
+
           write++
         }
-        isAsciiBackspaceOrDelete(client.buffer[read]) -> {
+        isAsciiBackspaceOrDelete(client.buffer[read]) && write > 0 -> {
           write--
-          if (client.buffer[read] == '$') {
+
+          if (temp[write] == '$') {
             write--
           }
         }
       }
+
       read++
-      truncate = write >= input.size - if (client.buffer[read] == '$') 1 else 2
     }
 
-    input[write] = ASCII_NULL
-
-    when (input[0]) {
-      '!' -> truncate = false
-      else -> client.lastInput = String(input.sliceArray(0 until write))
+    if (write < temp.lastIndex) {
+      temp[write] = ASCII_NULL
     }
 
-    client.input.add(client.lastInput)
-    client.output.add(client.lastInput + "\n\r") // debug
+    val input = String(temp.sliceArray(0 until write))
 
-    if (truncate) {
-      // inform the player
-      Log.debug { "Truncate" }
-
-      while (!isAsciiNewline(client.buffer[read])) {
-        read++
+    if (read < nl && write == temp.lastIndex) {
+      if (writeToClient(client, "Line too long.  Truncated to:\n\r${input}\n\r") < 0) {
+        return -1
       }
     }
 
-    while (isAsciiNewline(client.buffer[read])) {
+    if (!input.startsWith('!')) {
+      client.lastInput = input
+    }
+
+    client.input.add(client.lastInput)
+    client.output.add("${client.lastInput}\n\r") // debug
+
+    while (read < client.buffer.size && isAsciiNewline(client.buffer[read])) {
       read++
     }
 
-    var copy = 0
-    while (copy < client.buffer.size && client.buffer[copy] != ASCII_NULL) {
-      client.buffer[copy++] = client.buffer[read + copy]
-    }
+    nl = -1
+    while (read < client.buffer.size && client.buffer[read] != ASCII_NULL && nl < 0) {
+      read++
 
-    read = 0
-    write = 0
+      if (isAsciiNewline(client.buffer[read])) {
+        nl = read
+      }
+    }
+  }
+
+  var i = 0
+  while (read + i < client.buffer.size && client.buffer[i] != ASCII_NULL) {
+    client.buffer[i] = client.buffer[read + i]
+    i++
+  }
+
+  if (i < client.buffer.lastIndex) {
+    client.buffer[i] = ASCII_NULL
   }
 
   return bytesRead
@@ -301,9 +307,9 @@ fun processOutput(client: Client): Int {
   return bytesWritten
 }
 
-fun writeToClient(client: Client, s: String): Int {
+fun writeToClient(client: Client, message: String): Int {
   val bytesWritten = try {
-    client.socket.write(ByteBuffer.wrap(s.toByteArray()))
+    client.socket.write(ByteBuffer.wrap(message.toByteArray()))
   } catch (e: Throwable) {
     -1
   }
