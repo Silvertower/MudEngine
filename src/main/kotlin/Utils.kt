@@ -3,6 +3,8 @@ package net.roninmud.mudengine.utility
 const val MAX_STRING_LENGTH: Int = 4096
 const val MAX_INPUT_LENGTH: Int = 512
 
+const val CRLF: String = "\n\r"
+
 const val ASCII_NULL: Char = '\u0000'
 
 fun isAsciiBackspaceOrDelete(c: Char): Boolean {

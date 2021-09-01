@@ -5,7 +5,6 @@ import net.roninmud.mudengine.utility.*
 import java.net.BindException
 import java.net.InetSocketAddress
 import java.net.StandardSocketOptions
-import java.nio.ByteBuffer
 import java.nio.channels.SelectionKey
 import java.nio.channels.Selector
 import java.nio.channels.ServerSocketChannel
@@ -116,9 +115,9 @@ fun gameLoop(serverSocketChannel: ServerSocketChannel) {
     for (client in client_list) {
       client.ch.wait -= if (client.ch.wait > 0) 1 else 0
 
-      if (client.ch.wait > 0 || client.input.isEmpty()) continue
+      if (client.ch.wait > 0 || client.inputQueue.isEmpty()) continue
 
-      val input = client.input.remove()
+      val input = client.inputQueue.remove()
 
       client.ch.wait++
       client.hasPrompt = false
@@ -132,7 +131,7 @@ fun gameLoop(serverSocketChannel: ServerSocketChannel) {
 
     // Process client output.
     for (client in client_list) {
-      if (!writeSet.contains(client) || client.output.isEmpty()) continue
+      if (!writeSet.contains(client) || client.outputQueue.isEmpty()) continue
 
       if (processOutput(client) < 0) {
         closeClient(client)
@@ -224,11 +223,11 @@ fun closeClient(client: Client) {
 }
 
 fun processInput(client: Client): Int {
-  val readBuffer = ByteBuffer.allocate(client.buffer.size)
   var totalBytesRead = 0
+
   do {
     val bytesRead = try {
-      client.socket.read(readBuffer)
+      client.socket.read(client.inputBuffer)
     } catch (e: Throwable) {
       Log.error { "Error reading from client [ ${client.addr} ]." }
       Log.debug { e.printStackTrace() }
@@ -245,8 +244,8 @@ fun processInput(client: Client): Int {
     return totalBytesRead
   }
 
-  // Flip the buffer for reading.
-  readBuffer.flip()
+  // Flip the client's input buffer for reading.
+  client.inputBuffer.flip()
 
   // Setup an ASCII decoder that ignores malformed or unmappable characters.
   val decoder = StandardCharsets.US_ASCII
@@ -254,37 +253,28 @@ fun processInput(client: Client): Int {
     .onMalformedInput(CodingErrorAction.IGNORE)
     .onUnmappableCharacter(CodingErrorAction.IGNORE)
 
-  // Decode the buffer into ASCII.
-  val decoded = decoder.decode(readBuffer)
+  // Decode the client's input buffer into ASCII.
+  val buffer = decoder.decode(client.inputBuffer)
 
-  // Determine the existing offset of the client's buffer and the number of decoded characters to process.
-  val offset = client.buffer.indexOfFirst { c -> isAsciiNull(c) }
-  val length = decoded.remaining()
-
-  // Return -1 to close the client if the client's buffer would overflow after writing the decoded characters into it.
-  if (offset >= 0 && offset + length > client.buffer.size) {
-    return -1
-  }
-
-  // Write the decoded characters into the client's buffer, starting at the offset, or zero if the buffer is empty.
-  decoded.get(client.buffer, if (offset > -1) offset else 0, length)
+  // Clear the client's input buffer so it's empty for next time.
+  client.inputBuffer.clear()
 
   // Process the decoded characters and the resulting command(s). The '$' character is doubled for special use.
   var read = 0
-  var nl = client.buffer.indexOfFirst { c -> isAsciiNewline(c) }
+  var nl = buffer.indexOfFirst { c -> isAsciiNewline(c) }
   while (nl > -1) {
     var write = 0
     val temp = CharArray(MAX_INPUT_LENGTH)
-    while (read < nl && write < temp.size - if (client.buffer[read] != '$') 0 else 1) {
+    while (read < nl && write < temp.size - if (buffer[read] != '$') 0 else 1) {
       when {
-        isAsciiPrintable(client.buffer[read]) -> {
-          temp[write] = client.buffer[read]
+        isAsciiPrintable(buffer[read]) -> {
+          temp[write] = buffer[read]
 
           if (temp[write++] == '$') {
             temp[write++] = '$'
           }
         }
-        isAsciiBackspaceOrDelete(client.buffer[read]) && write > 0 -> {
+        isAsciiBackspaceOrDelete(buffer[read]) && write > 0 -> {
           if (temp[--write] == '$') {
             --write
           }
@@ -297,11 +287,9 @@ fun processInput(client: Client): Int {
     // Convert the temp character array into a string by taking the slice of characters that were written to it.
     val input = String(temp.sliceArray(0 until write))
 
-    // Check if the input was truncated because we didn't process all the way to the first newline characters.
+    // Check if the input was truncated because we didn't process all the way to the first newline character.
     if (read < nl && write == temp.lastIndex) {
-      if (writeToClient(client, "Line too long.  Truncated to:\n\r${input}\n\r") < 0) {
-        return -1
-      }
+      client.outputQueue.add("Line too long.  Truncated to:\n\r${input}\n\r")
     }
 
     // Update the client's last input text if we aren't repeating it.
@@ -310,31 +298,32 @@ fun processInput(client: Client): Int {
     }
 
     // Enqueue the client's last input text into its input queue.
-    client.input.add(client.lastInput)
+    client.inputQueue.add(client.lastInput)
 
     // Read past any remaining newline character(s) in the client's buffer.
-    while (read < client.buffer.size && isAsciiNewline(client.buffer[read])) {
+    while (read < buffer.length && isAsciiNewline(buffer[read])) {
       read++
     }
 
     // Check for the next newline character. If one is found, there is additional input to process.
     nl = -1
-    while (read < client.buffer.size && client.buffer[read] != ASCII_NULL && nl < 0) {
-      if (isAsciiNewline(client.buffer[++read])) {
+    while (read < buffer.length && buffer[read] != ASCII_NULL && nl < 0) {
+      if (isAsciiNewline(buffer[++read])) {
         nl = read
       }
     }
   }
 
-  // Move any remaining characters in the client's buffer to the front.
-  var i = 0
-  while (read + i < client.buffer.size && client.buffer[i] != ASCII_NULL) {
-    client.buffer[i++] = client.buffer[read + i]
-  }
+  // Compact whatever is left in the character buffer (e.g. an unfinished command).
+  buffer.compact()
 
-  // Mark the end of the client's buffer with an ASCII null character, unless the buffer is already full.
-  if (i < client.buffer.lastIndex) {
-    client.buffer[i] = ASCII_NULL
+  // Write whatever is left in the character buffer into the client's read buffer for next time.
+  try {
+    client.inputBuffer.put(StandardCharsets.US_ASCII.encode(buffer))
+  } catch (e: Throwable) {
+    Log.error { "Error writing to the client's read buffer [ ${client.addr} ]." }
+    Log.debug { e.printStackTrace() }
+    return -1
   }
 
   return totalBytesRead
@@ -346,15 +335,15 @@ fun processOutput(client: Client): Int {
   val preCRLF = client.hasPrompt && client.state == ConnectionState.PLAYING
   val postCRLF = client.state == ConnectionState.PLAYING
 
-  val capacity = client.socket.socket().sendBufferSize - if (preCRLF) 2 else 0 - if (postCRLF) 2 else 0
+  val capacity = client.socket.socket().sendBufferSize - if (preCRLF) CRLF.length else 0 - if (postCRLF) CRLF.length else 0
   val output: StringBuilder = StringBuilder(capacity)
 
   if (preCRLF) {
-    output.append("\n\r")
+    output.append(CRLF)
   }
 
-  while (client.output.isNotEmpty()) {
-    val text = client.output.remove()
+  while (client.outputQueue.isNotEmpty()) {
+    val text = client.outputQueue.remove()
 
     if (text.length > output.capacity()) {
       return -1
@@ -374,7 +363,7 @@ fun processOutput(client: Client): Int {
   }
 
   if (postCRLF) {
-    output.append("\n\r")
+    output.append(CRLF)
   }
 
   bytesWritten += writeToClient(client, output.toString())
@@ -383,13 +372,23 @@ fun processOutput(client: Client): Int {
 }
 
 fun writeToClient(client: Client, message: String): Int {
+  var totalBytesWritten = 0
+
   if (message.isEmpty()) return 0
 
-  val writeBuffer: ByteBuffer = ByteBuffer.wrap(message.toByteArray())
-  var totalBytesWritten = 0
+  try {
+    client.outputBuffer.put(message.toByteArray(StandardCharsets.US_ASCII))
+  } catch (e: Throwable) {
+    Log.error { "Error writing to client's output buffer [ ${client.addr} ]." }
+    Log.debug { e.printStackTrace() }
+    return -1
+  }
+
+  client.outputBuffer.flip()
+
   do {
     val bytesWritten = try {
-      client.socket.write(writeBuffer)
+      client.socket.write(client.outputBuffer)
     } catch (e: Throwable) {
       Log.error { "Error writing to client [ ${client.addr} ]." }
       Log.debug { e.printStackTrace() }
@@ -399,11 +398,9 @@ fun writeToClient(client: Client, message: String): Int {
     if (bytesWritten > 0) {
       totalBytesWritten += bytesWritten
     }
-  } while (bytesWritten > 0 && writeBuffer.remaining() > 0)
+  } while (bytesWritten > 0 && client.outputBuffer.remaining() > 0)
 
-  if (writeBuffer.remaining() > 0) {
-    client.output.add(message.slice(totalBytesWritten..message.lastIndex))
-  }
+  client.outputBuffer.compact()
 
   return totalBytesWritten
 }
