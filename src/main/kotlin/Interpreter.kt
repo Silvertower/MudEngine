@@ -5,12 +5,12 @@ import net.roninmud.mudengine.utility.*
 fun processCommand(ch: Character, input: String) {
   when (input.lowercase()) {
     "shutdown" -> game_info.mode = GameMode.SHUTDOWN
-//    else -> {
-//      // debug
-//      if (ch.client != null) {
-//        ch.client!!.output.add(input)
-//      }
-//    }
+    else -> {
+      // debug
+      if (ch.client != null) {
+        ch.client!!.outputQueue.add(input)
+      }
+    }
   }
 }
 

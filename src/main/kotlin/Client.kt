@@ -14,9 +14,9 @@ enum class ConnectionState {
 class Client(val socket: SocketChannel, val addr: String, val port: Int) {
   var state: ConnectionState = ConnectionState.DISCONNECTED
   var hasPrompt: Boolean = false
-  var lastInput: String = String()
-  val inputBuffer: ByteBuffer = ByteBuffer.allocate(MAX_STRING_LENGTH)
-  val outputBuffer: ByteBuffer = ByteBuffer.allocate(MAX_STRING_LENGTH)
+  var lastCommand: String = String()
+  var inputBuffer: ByteBuffer = ByteBuffer.allocate(MAX_STRING_LENGTH)
+  var outputBuffer: ByteBuffer = ByteBuffer.allocate(MAX_STRING_LENGTH)
   val inputQueue: Queue<String> = LinkedList()
   val outputQueue: Queue<String> = LinkedList()
   var ch: Character = Character()
